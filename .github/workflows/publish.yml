@@ -1,0 +1,106 @@
+name: Publish disclosures from Google Docs
+
+# Staff edit in Google Docs. Any Doc in the Released folder is exported to PDF,
+# committed to released/ (the version history), served at /<slug>.pdf, and each
+# changed PDF is emailed to the Green Board journal address.
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  export:
+    # Stays idle until the Released folder is configured, so the hourly run doesn't fail.
+    if: vars.RELEASED_FOLDER_ID != ''
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.export.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install google-api-python-client google-auth
+      - name: Export released Docs
+        id: export
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          RELEASED_FOLDER_ID: ${{ vars.RELEASED_FOLDER_ID }}
+        run: |
+          changed=$(python scripts/fetch_released.py | xargs)
+          echo "Changed: ${changed:-none}"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+      - name: Commit new versions
+        if: steps.export.outputs.changed != ''
+        run: |
+          git config user.name "disclosure-bot"
+          git config user.email "disclosure-bot@users.noreply.github.com"
+          git add released/
+          git commit -m "Release: ${{ steps.export.outputs.changed }}"
+          git push
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp released/*.pdf _site/
+          { echo '<!doctype html><meta charset="utf-8"><title>Darden Wealth Group Disclosures</title><h1>Disclosures</h1><ul>'
+            for f in released/*.pdf; do n=$(basename "$f"); echo "<li><a href=\"$n\">${n%.pdf}</a></li>"; done
+            echo '</ul>'; } > _site/index.html
+          [ -f CNAME ] && cp CNAME _site/CNAME
+          touch _site/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: export
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  greenboard:
+    needs: [export, deploy]
+    if: needs.export.outputs.changed != ''
+    runs-on: ubuntu-latest
+    env:
+      GREENBOARD_JOURNAL_ADDRESS: ${{ secrets.GREENBOARD_JOURNAL_ADDRESS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main   # includes the commit made by the export job
+      - name: Pick the changed PDFs
+        id: pdfs
+        run: |
+          list=$(for n in ${{ needs.export.outputs.changed }}; do printf 'released/%s.pdf,' "$n"; done)
+          echo "attachments=${list%,}" >> "$GITHUB_OUTPUT"
+      - name: Email Green Board
+        if: env.GREENBOARD_JOURNAL_ADDRESS != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.SMTP_FROM }}
+          to: ${{ secrets.GREENBOARD_JOURNAL_ADDRESS }}
+          subject: "Disclosure released: ${{ needs.export.outputs.changed }}"
+          body: |
+            Released to https://disclosures.dardenwealth.com/ from the Google Docs Released folder.
+            Documents: ${{ needs.export.outputs.changed }}
+            History: ${{ github.server_url }}/${{ github.repository }}/commits/main/released
+          attachments: ${{ steps.pdfs.outputs.attachments }}
+      - name: Warn when Green Board isn't configured
+        if: env.GREENBOARD_JOURNAL_ADDRESS == ''
+        run: echo "::warning::GREENBOARD_JOURNAL_ADDRESS secret is not set; released PDFs were not sent to Green Board."
